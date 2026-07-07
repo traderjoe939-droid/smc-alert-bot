@@ -25,6 +25,7 @@ from app.strategy.engine import StrategyEngine
 from app.strategy.indicators import resample_ohlc
 
 LOGGER = logging.getLogger(__name__)
+API_REQUEST_SPACING_SECONDS = 1.25
 
 
 class Worker:
@@ -113,9 +114,9 @@ class Worker:
                 risk_usd=self.settings.risk_per_trade_usd,
             )
             if evaluation.needs_m5_confirmation and m5_budget > 0:
+                m5_budget -= 1
                 try:
                     m5 = await self.data.get_time_series(symbol, "5min", 120)
-                    m5_budget -= 1
                     evaluation = self.engine.evaluate(
                         symbol=symbol,
                         m15=m15,
@@ -143,18 +144,33 @@ class Worker:
         )
 
     async def _fetch_m15_frames(self) -> dict[str, pd.DataFrame]:
-        async def fetch(symbol: str) -> tuple[str, pd.DataFrame | None]:
+        """Fetch M15 candles sequentially to avoid bursting the provider API."""
+
+        frames: dict[str, pd.DataFrame] = {}
+        symbols = list(self.symbol_config)
+
+        for index, symbol in enumerate(symbols):
             try:
                 frame = await self.data.get_time_series(
-                    symbol, "15min", self.settings.scan_output_size
+                    symbol,
+                    "15min",
+                    self.settings.scan_output_size,
                 )
-                return symbol, frame
+                frames[symbol] = frame
+                LOGGER.info(
+                    "M15 data loaded for %s: %d candles",
+                    symbol,
+                    len(frame),
+                )
             except Exception as exc:
                 LOGGER.exception("M15 fetch failed for %s: %s", symbol, exc)
-                return symbol, None
 
-        results = await asyncio.gather(*(fetch(symbol) for symbol in self.symbol_config))
-        return {symbol: frame for symbol, frame in results if frame is not None}
+            # Twelve Data Basic allows eight API credits per minute. Staggering
+            # the six M15 requests avoids sending all of them concurrently.
+            if index < len(symbols) - 1:
+                await asyncio.sleep(API_REQUEST_SPACING_SECONDS)
+
+        return frames
 
     async def _handle_evaluation(self, evaluation: Any) -> None:
         signal = evaluation.signal
@@ -172,7 +188,7 @@ class Worker:
 
         if existing.grade == SignalGrade.A and signal.grade == SignalGrade.A_PLUS:
             # Preserve manual tracking if the user already chose to track the A setup.
-            signal.tracked = existing.tracked or True
+            signal.tracked = True
             await self.state.save_signal(signal)
             await self.telegram.send_message(
                 format_signal_alert(signal, price_decimals=decimals)
