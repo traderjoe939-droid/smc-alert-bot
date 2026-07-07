@@ -30,7 +30,6 @@ services:
     plan: starter
     buildCommand: pip install -r requirements.txt
     startCommand: python -m app.worker
-    maxShutdownDelaySeconds: 30
     disk:
       name: smc-state
       mountPath: /var/data
