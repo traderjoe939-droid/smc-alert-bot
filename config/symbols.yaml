@@ -1,0 +1,80 @@
+account_currency: USD
+risk_per_trade_usd: 400.0
+broker_profile: IC Markets EU/Australia
+
+symbols:
+  EUR/USD:
+    enabled: true
+    mt5_symbol: EURUSD
+    base_currency: EUR
+    quote_currency: USD
+    contract_size: 100000
+    min_lot: 0.01
+    max_lot: 100.00
+    lot_step: 0.01
+    price_decimals: 5
+    pip_size: 0.0001
+
+  GBP/USD:
+    enabled: true
+    mt5_symbol: GBPUSD
+    base_currency: GBP
+    quote_currency: USD
+    contract_size: 100000
+    min_lot: 0.01
+    max_lot: 100.00
+    lot_step: 0.01
+    price_decimals: 5
+    pip_size: 0.0001
+
+  USD/JPY:
+    enabled: true
+    mt5_symbol: USDJPY
+    base_currency: USD
+    quote_currency: JPY
+    contract_size: 100000
+    min_lot: 0.01
+    max_lot: 100.00
+    lot_step: 0.01
+    price_decimals: 3
+    pip_size: 0.01
+
+  AUD/USD:
+    enabled: true
+    mt5_symbol: AUDUSD
+    base_currency: AUD
+    quote_currency: USD
+    contract_size: 100000
+    min_lot: 0.01
+    max_lot: 100.00
+    lot_step: 0.01
+    price_decimals: 5
+    pip_size: 0.0001
+
+  USD/CAD:
+    enabled: true
+    mt5_symbol: USDCAD
+    base_currency: USD
+    quote_currency: CAD
+    contract_size: 100000
+    min_lot: 0.01
+    max_lot: 100.00
+    lot_step: 0.01
+    price_decimals: 5
+    pip_size: 0.0001
+
+  GBP/JPY:
+    enabled: true
+    mt5_symbol: GBPJPY
+    base_currency: GBP
+    quote_currency: JPY
+    contract_size: 100000
+    min_lot: 0.01
+    max_lot: 100.00
+    lot_step: 0.01
+    price_decimals: 3
+    pip_size: 0.01
+
+  DAX:
+    enabled: false
+    note: Deferred until a matching DAX/GER40 data feed and broker contract specification are confirmed.

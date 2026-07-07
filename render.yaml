@@ -1,0 +1,60 @@
+services:
+  - type: web
+    name: smc-alert-api
+    runtime: python
+    region: frankfurt
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app.api:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
+    envVars:
+      - key: TWELVE_DATA_API_KEY
+        sync: false
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: TELEGRAM_CHAT_ID
+        sync: false
+      - key: API_AUTH_TOKEN
+        sync: false
+      - key: RISK_PER_TRADE_USD
+        value: "400"
+      - key: SYMBOLS
+        value: EUR/USD,GBP/USD,USD/JPY,AUD/USD,USD/CAD,GBP/JPY
+      - key: LOG_LEVEL
+        value: INFO
+
+  - type: worker
+    name: smc-alert-worker
+    runtime: python
+    region: frankfurt
+    plan: starter
+    buildCommand: pip install -r requirements.txt
+    startCommand: python -m app.worker
+    maxShutdownDelaySeconds: 30
+    disk:
+      name: smc-state
+      mountPath: /var/data
+      sizeGB: 1
+    envVars:
+      - key: TWELVE_DATA_API_KEY
+        sync: false
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: TELEGRAM_CHAT_ID
+        sync: false
+      - key: RISK_PER_TRADE_USD
+        value: "400"
+      - key: SYMBOLS
+        value: EUR/USD,GBP/USD,USD/JPY,AUD/USD,USD/CAD,GBP/JPY
+      - key: SCAN_OUTPUT_SIZE
+        value: "500"
+      - key: SCAN_GRACE_SECONDS
+        value: "20"
+      - key: ENABLE_WEBSOCKET
+        value: "true"
+      - key: SEND_STARTUP_MESSAGE
+        value: "true"
+      - key: STATE_DB_PATH
+        value: /var/data/smc_state.sqlite3
+      - key: LOG_LEVEL
+        value: INFO
