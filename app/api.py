@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
+import logging
 from typing import Annotated
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query
@@ -14,6 +15,9 @@ from app.settings import Settings, get_settings
 from app.strategy.engine import StrategyEngine
 from app.strategy.indicators import resample_ohlc
 
+
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 class LotSizeRequest(BaseModel):
     symbol: str = Field(examples=["EUR/USD"])

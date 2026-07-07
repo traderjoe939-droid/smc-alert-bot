@@ -14,7 +14,7 @@ class TelegramError(RuntimeError):
 
 
 class TelegramClient:
-    def __init__(self, token: str, chat_id: str, timeout_seconds: float = 20.0) -> None:
+    def __init__(self, token: str, chat_id: str, timeout_seconds: float = 35.0) -> None:
         if not token or not chat_id:
             raise ValueError("Telegram token and chat ID are required")
         self.chat_id = str(chat_id)
@@ -79,4 +79,4 @@ class TelegramClient:
                     if text.startswith("/"):
                         yield update_id, text
             except httpx.HTTPError as exc:
-                LOGGER.warning("Telegram polling error: %s", exc)
+                LOGGER.warning("Telegram polling error: %r", exc)

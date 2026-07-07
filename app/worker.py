@@ -340,6 +340,8 @@ async def async_main() -> None:
         level=getattr(logging, settings.log_level.upper(), logging.INFO),
         format="%(asctime)s %(levelname)s %(name)s — %(message)s",
     )
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
     worker = Worker(settings)
     loop = asyncio.get_running_loop()
     for signal_name in (os_signal.SIGINT, os_signal.SIGTERM):
