@@ -51,6 +51,8 @@ class Worker:
         self.state = StateStore(settings.state_db_path)
         self.engine = StrategyEngine()
         self.stop_event = asyncio.Event()
+
+        # True only when WebSocket tracking is enabled.
         self.websocket_available = settings.enable_websocket
 
     async def close(self) -> None:
@@ -87,6 +89,7 @@ class Worker:
 
         try:
             await self.stop_event.wait()
+
         finally:
             for task in tasks:
                 task.cancel()
@@ -112,6 +115,7 @@ class Worker:
                     self.stop_event.wait(),
                     timeout=delay,
                 )
+
             except TimeoutError:
                 pass
 
@@ -122,6 +126,7 @@ class Worker:
                 datetime.now(timezone.utc)
             ):
                 await self.scan_once()
+
             else:
                 LOGGER.info(
                     "Forex market window is closed; scan skipped"
@@ -149,7 +154,7 @@ class Worker:
 
         evaluations: dict[str, Any] = {}
 
-        # Basic 8:
+        # Basic 8 plan:
         # Six M15 calls plus at most two M5 calls per scan.
         m5_budget = 2
 
@@ -173,7 +178,7 @@ class Worker:
                     evaluation.needs_m5_confirmation
                     and m5_budget > 0
                 ):
-                    # Count attempted calls, not only successful calls.
+                    # Count attempted requests, not only successful ones.
                     m5_budget -= 1
 
                     try:
@@ -212,11 +217,23 @@ class Worker:
                     evaluation
                 )
 
-                # Candle-close fallback when WebSocket is unavailable.
+                # Fallback when WebSocket is unavailable:
+                # use the completed M15 candle's high and low to detect
+                # intrabar entry, SL, and target touches.
                 if not self.websocket_available:
-                    await self._process_price(
-                        symbol,
-                        float(m15["close"].iloc[-1]),
+                    latest_candle = m15.iloc[-1]
+
+                    await self._process_candle(
+                        symbol=symbol,
+                        candle_high=float(
+                            latest_candle["high"]
+                        ),
+                        candle_low=float(
+                            latest_candle["low"]
+                        ),
+                        candle_close=float(
+                            latest_candle["close"]
+                        ),
                     )
 
             except Exception as exc:
@@ -234,6 +251,7 @@ class Worker:
                     for symbol, evaluation in evaluations.items()
                 ),
             )
+
         else:
             LOGGER.warning(
                 "Scan finished without successful evaluations"
@@ -245,12 +263,12 @@ class Worker:
         """
         Fetch M15 candles sequentially.
 
-        This prevents the worker from bursting all six requests
-        at Twelve Data simultaneously.
+        This prevents all six requests from reaching Twelve Data
+        simultaneously and reduces temporary 502 errors.
         """
 
         frames: dict[str, pd.DataFrame] = {}
-        symbols = list(self.symbol_config)
+        symbols = list(self.symbol_config.keys())
 
         for index, symbol in enumerate(symbols):
             try:
@@ -267,9 +285,10 @@ class Worker:
 
                 if frame.empty:
                     LOGGER.warning(
-                        "Twelve Data returned an empty M15 frame for %s",
+                        "Empty M15 response received for %s",
                         symbol,
                     )
+
                 else:
                     frames[symbol] = frame
 
@@ -281,7 +300,7 @@ class Worker:
 
             except TwelveDataError as exc:
                 LOGGER.error(
-                    "M15 provider request failed for %s: %s",
+                    "M15 fetch failed for %s: %s",
                     symbol,
                     exc,
                 )
@@ -293,7 +312,6 @@ class Worker:
                     exc,
                 )
 
-            # Do not sleep after the final symbol.
             if index < len(symbols) - 1:
                 await asyncio.sleep(
                     API_REQUEST_SPACING_SECONDS
@@ -336,7 +354,7 @@ class Worker:
             existing.grade == SignalGrade.A
             and signal.grade == SignalGrade.A_PLUS
         ):
-            # A+ setups are automatically tracked.
+            # An upgraded A+ setup is automatically tracked.
             signal.tracked = True
 
             await self.state.save_signal(signal)
@@ -381,19 +399,43 @@ class Worker:
 
             await self.telegram.send_message(
                 "⚠️ Live WebSocket tracking is unavailable.\n\n"
-                "Signal scans will continue on completed M15 candles, "
-                "but entry/SL/TP alerts can be delayed until "
-                "WebSocket access is restored."
+                "Signal scans will continue on completed M15 candles. "
+                "Entry, SL, and TP touches will be detected from each "
+                "completed candle's high and low."
             )
 
-    async def _process_price(
+    async def _process_candle(
         self,
         symbol: str,
-        price: float,
+        candle_high: float,
+        candle_low: float,
+        candle_close: float,
     ) -> None:
-        tracked_signals = await self.state.active_signals()
+        """
+        Process a completed M15 candle using its full high-low range.
 
-        for tracked in tracked_signals:
+        Alerts are sent after the M15 candle closes, but a level counts
+        as touched whenever price traded through it intrabar.
+
+        Conservative same-candle rules:
+
+        1. Entry and SL both touched:
+           send the entry alert, then the SL alert.
+
+        2. For a trade entered before this candle, if both SL and a TP
+           were touched, SL takes priority because OHLC data cannot
+           determine which level was reached first.
+        """
+
+        LOGGER.info(
+            "Processing M15 range for %s: high=%s low=%s close=%s",
+            symbol,
+            candle_high,
+            candle_low,
+            candle_close,
+        )
+
+        for tracked in await self.state.active_signals():
             if tracked.symbol != symbol:
                 continue
 
@@ -406,7 +448,278 @@ class Worker:
                 tracked.status = SignalStatus.EXPIRED
                 tracked.tracked = False
 
-                await self.state.save_signal(tracked)
+                await self.state.save_signal(
+                    tracked
+                )
+
+                continue
+
+            if tracked.direction == Direction.BUY:
+                entry_touched = (
+                    candle_low <= tracked.entry
+                )
+
+                stop_touched = (
+                    candle_low <= tracked.stop_loss
+                )
+
+                tp1_touched = (
+                    candle_high >= tracked.tp1
+                )
+
+                tp2_touched = (
+                    candle_high >= tracked.tp2
+                )
+
+                tp3_touched = (
+                    candle_high >= tracked.tp3
+                )
+
+            else:
+                entry_touched = (
+                    candle_high >= tracked.entry
+                )
+
+                stop_touched = (
+                    candle_high >= tracked.stop_loss
+                )
+
+                tp1_touched = (
+                    candle_low <= tracked.tp1
+                )
+
+                tp2_touched = (
+                    candle_low <= tracked.tp2
+                )
+
+                tp3_touched = (
+                    candle_low <= tracked.tp3
+                )
+
+            # The signal has not entered yet.
+            if not tracked.entry_hit:
+                if (
+                    stop_touched
+                    and not entry_touched
+                ):
+                    tracked.status = (
+                        SignalStatus.INVALIDATED
+                    )
+
+                    tracked.tracked = False
+
+                    await self.state.save_signal(
+                        tracked
+                    )
+
+                    await self.telegram.send_message(
+                        format_invalidation_alert(
+                            tracked
+                        )
+                    )
+
+                    continue
+
+                # The entry traded intrabar, regardless of whether the
+                # M15 candle closed above, on, or below the entry.
+                if entry_touched:
+                    tracked.entry_hit = True
+                    tracked.status = (
+                        SignalStatus.ENTERED
+                    )
+
+                    await self.state.save_signal(
+                        tracked
+                    )
+
+                    await self.telegram.send_message(
+                        format_entry_alert(
+                            tracked
+                        )
+                    )
+
+                    # Entry and SL were both inside this candle.
+                    # Assume entry occurred and was then stopped.
+                    if stop_touched:
+                        tracked.stop_hit = True
+                        tracked.status = (
+                            SignalStatus.STOPPED
+                        )
+
+                        tracked.tracked = False
+
+                        await self.state.save_signal(
+                            tracked
+                        )
+
+                        await self.telegram.send_message(
+                            format_stop_alert(
+                                tracked
+                            )
+                        )
+
+                        continue
+
+                    # Entry and targets may also be touched during the
+                    # same completed candle.
+                    target_touches = (
+                        (
+                            "tp1",
+                            tp1_touched,
+                            SignalStatus.TP1,
+                        ),
+                        (
+                            "tp2",
+                            tp2_touched,
+                            SignalStatus.TP2,
+                        ),
+                        (
+                            "tp3",
+                            tp3_touched,
+                            SignalStatus.TP3,
+                        ),
+                    )
+
+                    for (
+                        name,
+                        touched,
+                        status,
+                    ) in target_touches:
+                        already_hit = getattr(
+                            tracked,
+                            f"{name}_hit",
+                        )
+
+                        if (
+                            touched
+                            and not already_hit
+                        ):
+                            setattr(
+                                tracked,
+                                f"{name}_hit",
+                                True,
+                            )
+
+                            tracked.status = status
+
+                            if name == "tp3":
+                                tracked.tracked = False
+
+                            await self.state.save_signal(
+                                tracked
+                            )
+
+                            await self.telegram.send_message(
+                                format_target_alert(
+                                    tracked,
+                                    name,
+                                )
+                            )
+
+                continue
+
+            # The trade was already entered before this candle.
+            # SL takes priority when SL and TP appear within the same
+            # completed candle.
+            if stop_touched:
+                tracked.stop_hit = True
+                tracked.status = (
+                    SignalStatus.STOPPED
+                )
+
+                tracked.tracked = False
+
+                await self.state.save_signal(
+                    tracked
+                )
+
+                await self.telegram.send_message(
+                    format_stop_alert(
+                        tracked
+                    )
+                )
+
+                continue
+
+            target_touches = (
+                (
+                    "tp1",
+                    tp1_touched,
+                    SignalStatus.TP1,
+                ),
+                (
+                    "tp2",
+                    tp2_touched,
+                    SignalStatus.TP2,
+                ),
+                (
+                    "tp3",
+                    tp3_touched,
+                    SignalStatus.TP3,
+                ),
+            )
+
+            for (
+                name,
+                touched,
+                status,
+            ) in target_touches:
+                already_hit = getattr(
+                    tracked,
+                    f"{name}_hit",
+                )
+
+                if (
+                    touched
+                    and not already_hit
+                ):
+                    setattr(
+                        tracked,
+                        f"{name}_hit",
+                        True,
+                    )
+
+                    tracked.status = status
+
+                    if name == "tp3":
+                        tracked.tracked = False
+
+                    await self.state.save_signal(
+                        tracked
+                    )
+
+                    await self.telegram.send_message(
+                        format_target_alert(
+                            tracked,
+                            name,
+                        )
+                    )
+
+    async def _process_price(
+        self,
+        symbol: str,
+        price: float,
+    ) -> None:
+        """
+        Process live WebSocket prices when full streaming is available.
+        """
+
+        for tracked in await self.state.active_signals():
+            if tracked.symbol != symbol:
+                continue
+
+            now = datetime.now(timezone.utc)
+
+            if (
+                now >= tracked.expires_at
+                and not tracked.entry_hit
+            ):
+                tracked.status = SignalStatus.EXPIRED
+                tracked.tracked = False
+
+                await self.state.save_signal(
+                    tracked
+                )
 
                 continue
 
@@ -420,13 +733,20 @@ class Worker:
                 )
 
                 if invalid:
-                    tracked.status = SignalStatus.INVALIDATED
+                    tracked.status = (
+                        SignalStatus.INVALIDATED
+                    )
+
                     tracked.tracked = False
 
-                    await self.state.save_signal(tracked)
+                    await self.state.save_signal(
+                        tracked
+                    )
 
                     await self.telegram.send_message(
-                        format_invalidation_alert(tracked)
+                        format_invalidation_alert(
+                            tracked
+                        )
                     )
 
                     continue
@@ -441,12 +761,18 @@ class Worker:
 
                 if entry_hit:
                     tracked.entry_hit = True
-                    tracked.status = SignalStatus.ENTERED
+                    tracked.status = (
+                        SignalStatus.ENTERED
+                    )
 
-                    await self.state.save_signal(tracked)
+                    await self.state.save_signal(
+                        tracked
+                    )
 
                     await self.telegram.send_message(
-                        format_entry_alert(tracked)
+                        format_entry_alert(
+                            tracked
+                        )
                     )
 
                 continue
@@ -464,10 +790,14 @@ class Worker:
                 tracked.status = SignalStatus.STOPPED
                 tracked.tracked = False
 
-                await self.state.save_signal(tracked)
+                await self.state.save_signal(
+                    tracked
+                )
 
                 await self.telegram.send_message(
-                    format_stop_alert(tracked)
+                    format_stop_alert(
+                        tracked
+                    )
                 )
 
                 continue
@@ -519,7 +849,9 @@ class Worker:
                     if name == "tp3":
                         tracked.tracked = False
 
-                    await self.state.save_signal(tracked)
+                    await self.state.save_signal(
+                        tracked
+                    )
 
                     await self.telegram.send_message(
                         format_target_alert(
@@ -533,7 +865,11 @@ class Worker:
             "telegram_update_offset"
         )
 
-        offset = int(stored) if stored else None
+        offset = (
+            int(stored)
+            if stored
+            else None
+        )
 
         async for (
             update_id,
@@ -546,7 +882,9 @@ class Worker:
                 str(update_id + 1),
             )
 
-            await self._handle_command(text)
+            await self._handle_command(
+                text
+            )
 
     async def _handle_command(
         self,
@@ -568,6 +906,7 @@ class Worker:
                 await self.telegram.send_message(
                     "Usage: /track EURUSD"
                 )
+
                 return
 
             signal = await self.state.latest_a_for_symbol(
@@ -579,15 +918,20 @@ class Worker:
                     f"No current A setup found for "
                     f"{parts[1].upper()}."
                 )
+
                 return
 
             signal.tracked = True
             signal.status = SignalStatus.TRACKING
 
-            await self.state.save_signal(signal)
+            await self.state.save_signal(
+                signal
+            )
 
             await self.telegram.send_message(
-                format_tracking_alert(signal)
+                format_tracking_alert(
+                    signal
+                )
             )
 
         elif command == "/status":
@@ -597,6 +941,7 @@ class Worker:
                 await self.telegram.send_message(
                     "No signals are currently being tracked."
                 )
+
                 return
 
             lines = [
@@ -643,6 +988,7 @@ class Worker:
                 )
                 + timedelta(hours=1)
             )
+
         else:
             boundary = now.replace(
                 minute=next_minute,
@@ -670,11 +1016,17 @@ class Worker:
             return False
 
         # Sunday before approximately 21:00 UTC
-        if weekday == 6 and now.hour < 21:
+        if (
+            weekday == 6
+            and now.hour < 21
+        ):
             return False
 
         # Friday after approximately 22:00 UTC
-        if weekday == 4 and now.hour >= 22:
+        if (
+            weekday == 4
+            and now.hour >= 22
+        ):
             return False
 
         return True
@@ -695,15 +1047,21 @@ async def async_main() -> None:
         ),
     )
 
-    logging.getLogger("httpx").setLevel(
+    logging.getLogger(
+        "httpx"
+    ).setLevel(
         logging.WARNING
     )
 
-    logging.getLogger("httpcore").setLevel(
+    logging.getLogger(
+        "httpcore"
+    ).setLevel(
         logging.WARNING
     )
 
-    worker = Worker(settings)
+    worker = Worker(
+        settings
+    )
 
     loop = asyncio.get_running_loop()
 
@@ -716,17 +1074,21 @@ async def async_main() -> None:
                 signal_name,
                 worker.stop_event.set,
             )
+
         except NotImplementedError:
             pass
 
     try:
         await worker.run()
+
     finally:
         await worker.close()
 
 
 def main() -> None:
-    asyncio.run(async_main())
+    asyncio.run(
+        async_main()
+    )
 
 
 if __name__ == "__main__":
