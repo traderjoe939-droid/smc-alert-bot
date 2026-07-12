@@ -20,8 +20,9 @@ CHECK_LABELS = {
     "liquidity_sweep": "Liquidity Sweep",
     "displacement_choch": "Displacement + CHoCH",
     "retrace": "FVG / OB Retracement",
-    "clean_3r": "Clean 3R Path",
+    "clean_3r": "Clean 2R Path",
 }
+
 CORE_CHECKS = ("htf_bias", "liquidity_sweep", "displacement_choch")
 
 
@@ -81,26 +82,33 @@ class StrategyEngine:
     ) -> StrategyEvaluation:
         now = now or datetime.now(timezone.utc)
         empty_checks = {key: False for key in CHECK_LABELS}
+
         if min(len(m15), len(h1), len(h4)) < 30:
             return StrategyEvaluation(
                 symbol, None, empty_checks, 0, False, "Insufficient candle history"
             )
 
         bias = combined_bias(h4, h1)
+
         if bias == Bias.NEUTRAL:
             return StrategyEvaluation(
                 symbol, None, empty_checks, 0, False, "H4 and H1 bias are not aligned"
             )
+
         direction = Direction.BUY if bias == Bias.BULLISH else Direction.SELL
+
         checks = dict(empty_checks)
         checks["htf_bias"] = True
 
         sweep = self._find_latest_sweep(m15, direction)
+
         if sweep is None:
             return StrategyEvaluation(
                 symbol, direction, checks, 1, False, "No valid recent M15 liquidity sweep"
             )
+
         checks["liquidity_sweep"] = True
+
         checks["htf_key_zone"] = self._valid_htf_zone(
             price=sweep.extreme,
             direction=direction,
@@ -109,8 +117,10 @@ class StrategyEngine:
         )
 
         leg = self._find_leg(m15, direction, sweep)
+
         if leg is None:
             score = sum(checks.values())
+
             return StrategyEvaluation(
                 symbol,
                 direction,
@@ -119,32 +129,33 @@ class StrategyEngine:
                 False,
                 "Sweep found, but displacement/CHoCH or entry zone is incomplete",
             )
+
         checks["displacement_choch"] = True
 
         entry = leg.zone.midpoint
+
         m15_atr = float(atr(m15).iloc[-1])
+
         if pd.isna(m15_atr) or m15_atr <= 0:
             return StrategyEvaluation(
-                symbol, direction, checks, sum(checks.values()), False, "ATR unavailable"
+                symbol,
+                direction,
+                checks,
+                sum(checks.values()),
+                False,
+                "ATR unavailable",
             )
+
         minimum_stop_distance = float(symbol_config.get("minimum_stop_distance", 0.0))
         buffer = max(0.10 * m15_atr, minimum_stop_distance)
+
         if direction == Direction.BUY:
             stop_loss = sweep.extreme - buffer
             risk_distance = entry - stop_loss
-            tp1, tp2, tp3 = (
-                entry + risk_distance,
-                entry + 2 * risk_distance,
-                entry + 3 * risk_distance,
-            )
+
         else:
             stop_loss = sweep.extreme + buffer
             risk_distance = stop_loss - entry
-            tp1, tp2, tp3 = (
-                entry - risk_distance,
-                entry - 2 * risk_distance,
-                entry - 3 * risk_distance,
-            )
 
         if risk_distance <= 0:
             return StrategyEvaluation(
@@ -156,16 +167,26 @@ class StrategyEngine:
                 "Entry zone is on the wrong side of the structural stop",
             )
 
+        tp1, tp2, tp3, clean_2r_target = self._market_structure_targets(
+            direction=direction,
+            entry=entry,
+            risk_distance=risk_distance,
+            m15=m15,
+            h1=h1,
+            h4=h4,
+        )
+
         checks["clean_3r"] = self._clean_3r_path(
             direction=direction,
             entry=entry,
-            tp3=tp3,
+            tp3=clean_2r_target,
             m15=m15,
             h1=h1,
         )
 
         touched = leg.touch_timestamp is not None
         needs_m5 = touched and m5 is None
+
         checks["retrace"] = touched and self._m5_confirmation(
             direction=direction,
             midpoint=entry,
@@ -175,16 +196,19 @@ class StrategyEngine:
         )
 
         score = sum(checks.values())
+
         if not all(checks[key] for key in CORE_CHECKS):
             return StrategyEvaluation(
                 symbol, direction, checks, score, needs_m5, "A core condition is missing"
             )
+
         if score < 5:
             return StrategyEvaluation(
                 symbol, direction, checks, score, needs_m5, "Setup is below A grade"
             )
 
         grade = SignalGrade.A_PLUS if score == 6 else SignalGrade.A
+
         missing_key = next((key for key, passed in checks.items() if not passed), None)
         missing = CHECK_LABELS[missing_key] if missing_key else None
 
@@ -202,6 +226,7 @@ class StrategyEngine:
 
         zone_time = leg.zone.created_at
         signal_id = self._signal_id(symbol, direction, sweep.timestamp, zone_time)
+
         signal = Signal(
             signal_id=signal_id,
             symbol=symbol,
@@ -227,6 +252,7 @@ class StrategyEngine:
             status=SignalStatus.ENTERED if grade == SignalGrade.A_PLUS else SignalStatus.PLANNED,
             entry_hit=grade == SignalGrade.A_PLUS,
         )
+
         return StrategyEvaluation(
             symbol=symbol,
             direction=direction,
@@ -238,7 +264,9 @@ class StrategyEngine:
         )
 
     def _find_latest_sweep(
-        self, frame: pd.DataFrame, direction: Direction
+        self,
+        frame: pd.DataFrame,
+        direction: Direction,
     ) -> SweepContext | None:
         highs, lows = confirmed_swings(frame)
         atr_values = atr(frame)
@@ -247,14 +275,17 @@ class StrategyEngine:
 
         for position in range(start, len(frame)):
             atr_value = float(atr_values.iloc[position])
+
             if pd.isna(atr_value) or atr_value <= 0:
                 continue
 
             if direction == Direction.BUY:
                 reference = latest_swing_before(lows, position)
                 structure = latest_swing_before(highs, position)
+
                 if not reference or not structure or position - reference.position > 50:
                     continue
+
                 extreme = float(frame["low"].iloc[position])
                 swept = extreme <= reference.price - 0.05 * atr_value
                 same_recovery = float(frame["close"].iloc[position]) > reference.price
@@ -262,11 +293,14 @@ class StrategyEngine:
                     position + 1 < len(frame)
                     and float(frame["close"].iloc[position + 1]) > reference.price
                 )
+
             else:
                 reference = latest_swing_before(highs, position)
                 structure = latest_swing_before(lows, position)
+
                 if not reference or not structure or position - reference.position > 50:
                     continue
+
                 extreme = float(frame["high"].iloc[position])
                 swept = extreme >= reference.price + 0.05 * atr_value
                 same_recovery = float(frame["close"].iloc[position]) < reference.price
@@ -277,7 +311,9 @@ class StrategyEngine:
 
             if not swept or not (same_recovery or next_recovery):
                 continue
+
             recovery_position = position if same_recovery else position + 1
+
             candidates.append(
                 SweepContext(
                     position=position,
@@ -289,6 +325,7 @@ class StrategyEngine:
                     timestamp=frame.index[position],
                 )
             )
+
         return candidates[-1] if candidates else None
 
     def _find_leg(
@@ -299,42 +336,54 @@ class StrategyEngine:
     ) -> LegContext | None:
         last_position = min(len(frame) - 1, sweep.position + 3)
         displacement_position: int | None = None
+
         for position in range(sweep.position, last_position + 1):
             if direction == Direction.BUY:
                 qualifies = is_bullish_displacement(frame, position) and float(
                     frame["close"].iloc[position]
                 ) > sweep.structure_price
+
             else:
                 qualifies = is_bearish_displacement(frame, position) and float(
                     frame["close"].iloc[position]
                 ) < sweep.structure_price
+
             if qualifies:
                 displacement_position = position
                 break
+
         if displacement_position is None:
             return None
 
         fvg = self._entry_fvg(frame, direction, displacement_position)
         order_block = self._entry_order_block(frame, direction, displacement_position)
+
         zone = select_entry_zone(fvg, order_block)
+
         if zone is None:
             return None
 
         after_start = min(displacement_position + 1, len(frame))
         touch_timestamp: pd.Timestamp | None = None
+
         for position in range(after_start, len(frame)):
             row = frame.iloc[position]
+
             if direction == Direction.BUY:
                 invalid = float(row["close"]) < zone.lower
                 touched = float(row["low"]) <= zone.midpoint
+
             else:
                 invalid = float(row["close"]) > zone.upper
                 touched = float(row["high"]) >= zone.midpoint
+
             if invalid:
                 break
+
             if touched:
                 touch_timestamp = frame.index[position]
                 break
+
         return LegContext(displacement_position, zone, touch_timestamp)
 
     def _entry_fvg(
@@ -344,20 +393,27 @@ class StrategyEngine:
         displacement_position: int,
     ) -> ZoneCandidate | None:
         atr_values = atr(frame)
+
         for position in (displacement_position, displacement_position + 1):
             if position < 2 or position >= len(frame):
                 continue
+
             a = frame.iloc[position - 2]
             c = frame.iloc[position]
             atr_value = float(atr_values.iloc[position])
+
             if pd.isna(atr_value) or atr_value <= 0:
                 continue
+
             if direction == Direction.BUY and c["low"] > a["high"]:
                 lower, upper = float(a["high"]), float(c["low"])
+
             elif direction == Direction.SELL and c["high"] < a["low"]:
                 lower, upper = float(c["high"]), float(a["low"])
+
             else:
                 continue
+
             if upper - lower >= 0.10 * atr_value:
                 return ZoneCandidate(
                     PriceZone(
@@ -368,6 +424,7 @@ class StrategyEngine:
                     ),
                     position,
                 )
+
         return None
 
     def _entry_order_block(
@@ -379,7 +436,9 @@ class StrategyEngine:
         for position in range(displacement_position - 1, max(-1, displacement_position - 4), -1):
             if position < 0:
                 break
+
             row = frame.iloc[position]
+
             if direction == Direction.BUY and row["close"] < row["open"]:
                 return ZoneCandidate(
                     PriceZone(
@@ -390,6 +449,7 @@ class StrategyEngine:
                     ),
                     position,
                 )
+
             if direction == Direction.SELL and row["close"] > row["open"]:
                 return ZoneCandidate(
                     PriceZone(
@@ -400,6 +460,7 @@ class StrategyEngine:
                     ),
                     position,
                 )
+
         return None
 
     def _valid_htf_zone(
@@ -411,17 +472,22 @@ class StrategyEngine:
         h4: pd.DataFrame,
     ) -> bool:
         h4_highs, h4_lows = confirmed_swings(h4)
+
         if not h4_highs or not h4_lows:
             return False
+
         range_high = h4_highs[-1].price
         range_low = h4_lows[-1].price
+
         if range_high <= range_low:
             return False
+
         midpoint = (range_high + range_low) / 2
         lower_twenty = range_low + 0.20 * (range_high - range_low)
         upper_twenty = range_high - 0.20 * (range_high - range_low)
 
         h1_atr = float(atr(h1).iloc[-1])
+
         if pd.isna(h1_atr) or h1_atr <= 0:
             return False
 
@@ -429,17 +495,24 @@ class StrategyEngine:
         h4_fvgs = find_fvgs(h4, direction, max_age=60)
         h1_obs = find_order_blocks(h1, direction, max_age=100)
         h4_obs = find_order_blocks(h4, direction, max_age=60)
+
         zones = [candidate.zone for candidate in h1_fvgs + h4_fvgs + h1_obs + h4_obs]
-        near_zone = any(self._distance_to_zone(price, zone) <= 0.25 * h1_atr for zone in zones)
+
+        near_zone = any(
+            self._distance_to_zone(price, zone) <= 0.25 * h1_atr
+            for zone in zones
+        )
 
         if direction == Direction.BUY:
             return (price <= midpoint and near_zone) or price <= lower_twenty
+
         return (price >= midpoint and near_zone) or price >= upper_twenty
 
     @staticmethod
     def _distance_to_zone(price: float, zone: PriceZone) -> float:
         if zone.lower <= price <= zone.upper:
             return 0.0
+
         return min(abs(price - zone.lower), abs(price - zone.upper))
 
     @staticmethod
@@ -453,19 +526,189 @@ class StrategyEngine:
     ) -> bool:
         if touch_timestamp is None or m5 is None or m5.empty:
             return False
+
         after = m5[m5.index >= touch_timestamp]
+
         for _, row in after.iterrows():
             if direction == Direction.BUY:
                 if float(row["close"]) <= stop_loss:
                     return False
+
                 if row["close"] > row["open"] and row["close"] >= midpoint:
                     return True
+
             else:
                 if float(row["close"]) >= stop_loss:
                     return False
+
                 if row["close"] < row["open"] and row["close"] <= midpoint:
                     return True
+
         return False
+
+    @staticmethod
+    def _market_structure_targets(
+        *,
+        direction: Direction,
+        entry: float,
+        risk_distance: float,
+        m15: pd.DataFrame,
+        h1: pd.DataFrame,
+        h4: pd.DataFrame,
+    ) -> tuple[float, float, float, float]:
+        """
+        Target logic:
+
+        TP1 = nearest M15 internal liquidity.
+        TP2 = fixed 1.5R.
+        TP3 = nearest H1/H4 external liquidity, preferably beyond 2R.
+        Clean path check = theoretical 2R level.
+        """
+
+        if direction == Direction.BUY:
+            fixed_1r = entry + risk_distance
+            fixed_15r = entry + 1.5 * risk_distance
+            fixed_2r = entry + 2.0 * risk_distance
+            fixed_3r = entry + 3.0 * risk_distance
+
+            tp1 = StrategyEngine._nearest_liquidity_above(
+                frame=m15,
+                entry=entry,
+                fallback=fixed_1r,
+            )
+
+            tp2 = fixed_15r
+
+            tp3 = StrategyEngine._external_liquidity_above(
+                h1=h1,
+                h4=h4,
+                entry=entry,
+                minimum_target=fixed_2r,
+                fallback=fixed_3r,
+            )
+
+            return tp1, tp2, tp3, fixed_2r
+
+        fixed_1r = entry - risk_distance
+        fixed_15r = entry - 1.5 * risk_distance
+        fixed_2r = entry - 2.0 * risk_distance
+        fixed_3r = entry - 3.0 * risk_distance
+
+        tp1 = StrategyEngine._nearest_liquidity_below(
+            frame=m15,
+            entry=entry,
+            fallback=fixed_1r,
+        )
+
+        tp2 = fixed_15r
+
+        tp3 = StrategyEngine._external_liquidity_below(
+            h1=h1,
+            h4=h4,
+            entry=entry,
+            maximum_target=fixed_2r,
+            fallback=fixed_3r,
+        )
+
+        return tp1, tp2, tp3, fixed_2r
+
+    @staticmethod
+    def _nearest_liquidity_above(
+        *,
+        frame: pd.DataFrame,
+        entry: float,
+        fallback: float,
+    ) -> float:
+        highs, _ = confirmed_swings(frame)
+
+        targets = sorted(
+            swing.price
+            for swing in highs
+            if swing.price > entry
+        )
+
+        return float(targets[0]) if targets else float(fallback)
+
+    @staticmethod
+    def _nearest_liquidity_below(
+        *,
+        frame: pd.DataFrame,
+        entry: float,
+        fallback: float,
+    ) -> float:
+        _, lows = confirmed_swings(frame)
+
+        targets = sorted(
+            (
+                swing.price
+                for swing in lows
+                if swing.price < entry
+            ),
+            reverse=True,
+        )
+
+        return float(targets[0]) if targets else float(fallback)
+
+    @staticmethod
+    def _external_liquidity_above(
+        *,
+        h1: pd.DataFrame,
+        h4: pd.DataFrame,
+        entry: float,
+        minimum_target: float,
+        fallback: float,
+    ) -> float:
+        h1_highs, _ = confirmed_swings(h1)
+        h4_highs, _ = confirmed_swings(h4)
+
+        preferred = sorted(
+            swing.price
+            for swing in h1_highs + h4_highs
+            if swing.price >= minimum_target
+        )
+
+        if preferred:
+            return float(preferred[0])
+
+        any_above = sorted(
+            swing.price
+            for swing in h1_highs + h4_highs
+            if swing.price > entry
+        )
+
+        return float(any_above[-1]) if any_above else float(fallback)
+
+    @staticmethod
+    def _external_liquidity_below(
+        *,
+        h1: pd.DataFrame,
+        h4: pd.DataFrame,
+        entry: float,
+        maximum_target: float,
+        fallback: float,
+    ) -> float:
+        _, h1_lows = confirmed_swings(h1)
+        _, h4_lows = confirmed_swings(h4)
+
+        preferred = sorted(
+            (
+                swing.price
+                for swing in h1_lows + h4_lows
+                if swing.price <= maximum_target
+            ),
+            reverse=True,
+        )
+
+        if preferred:
+            return float(preferred[0])
+
+        any_below = sorted(
+            swing.price
+            for swing in h1_lows + h4_lows
+            if swing.price < entry
+        )
+
+        return float(any_below[0]) if any_below else float(fallback)
 
     @staticmethod
     def _clean_3r_path(
@@ -476,20 +719,31 @@ class StrategyEngine:
         m15: pd.DataFrame,
         h1: pd.DataFrame,
     ) -> bool:
+        """
+        Despite the method name, this now validates the path to the level
+        passed as `tp3`.
+
+        The strategy passes the theoretical 2R target into this function,
+        so the live rule is: Clean 2R Path.
+        """
+
         m15_highs, m15_lows = confirmed_swings(m15)
         h1_highs, h1_lows = confirmed_swings(h1)
+
         if direction == Direction.BUY:
             obstacles = [
                 swing.price
                 for swing in m15_highs + h1_highs
                 if entry < swing.price < tp3
             ]
+
         else:
             obstacles = [
                 swing.price
                 for swing in m15_lows + h1_lows
                 if tp3 < swing.price < entry
             ]
+
         return not obstacles
 
     @staticmethod
@@ -500,4 +754,5 @@ class StrategyEngine:
         zone_time: datetime,
     ) -> str:
         raw = f"{symbol}|{direction.value}|{sweep_time.isoformat()}|{zone_time.isoformat()}"
+
         return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:12].upper()
